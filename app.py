@@ -377,8 +377,8 @@ def build_bullet_rewrite_request(bullets: list[dict[str, Any]], strict: bool = F
     intro = "Stay within the exact length bounds." if strict else "Stay as close as possible to the original length bounds."
     rows = [intro]
     for bullet in bullets:
-        min_chars = max(10, int(round(bullet["char_count"] * 0.9)))
-        max_chars = max(min_chars + 4, int(round(bullet["char_count"] * 1.1)))
+        min_chars = max(10, int(round(bullet["char_count"] * 0.8)))
+        max_chars = max(min_chars + 4, int(round(bullet["char_count"] * 1.2)))
         rows.append(f"{bullet['id']}::min={min_chars}::max={max_chars}::bullet={bullet['original_text']}")
     return "\n".join(rows)
 
@@ -400,8 +400,8 @@ def parse_bullet_rewrite_response(response_text: str) -> dict[int, str]:
 def is_valid_bullet_rewrite(original_bullet: dict[str, Any], rewritten_text: str) -> bool:
     if not rewritten_text or not rewritten_text.startswith("• "):
         return False
-    min_chars = max(10, int(round(original_bullet["char_count"] * 0.9)))
-    max_chars = max(min_chars + 4, int(round(original_bullet["char_count"] * 1.1)))
+    min_chars = max(10, int(round(original_bullet["char_count"] * 0.8)))
+    max_chars = max(min_chars + 4, int(round(original_bullet["char_count"] * 1.2)))
     return min_chars <= len(rewritten_text) <= max_chars
 
 
@@ -531,10 +531,13 @@ def build_refined_pdf(file_bytes: bytes, pages_data: list[dict[str, Any]], bulle
         ]
 
         for block in bullet_blocks:
+            page.add_redact_annot(fitz.Rect(block["rect"]), fill=(1, 1, 1))
+        if bullet_blocks:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        for block in bullet_blocks:
             bullet_id = block.get("bullet_id")
             rewritten_text = bullet_rewrites.get(bullet_id, block.get("text", ""))
-            rect = fitz.Rect(block["rect"])
-            page.draw_rect(rect, color=None, fill=(1, 1, 1), overlay=True)
             fit_bullet_text_to_block(page, block, rewritten_text)
 
     buffer = BytesIO()
