@@ -94,7 +94,7 @@ def clean_resume_output(text: str) -> str:
     cleaned = re.sub(r"^---+$", "", cleaned, flags=re.MULTILINE)
     cleaned = cleaned.replace("â€¢", "•")
     cleaned = cleaned.replace("ï‚·", "•")
-    cleaned = re.sub(r"(?m)^[ \t]*[?][ \t]+", "• ", cleaned)
+    cleaned = re.sub(r"(?m)^[ \t]*[?\uFFFD\uf0b7\u2022\u25cf\u25cb\u25aa\uf0a7][ \t]+", "• ", cleaned)
     cleaned = re.sub(r"(?m)^[ \t]*[\-*][ \t]*", "- ", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\n[ \t]+\n", "\n\n", cleaned)
@@ -107,8 +107,31 @@ def normalize_bullet_text(text: str) -> str:
     return f"• {cleaned}" if cleaned else ""
 
 
+_PDF_BULLET_CHARS = {
+    "\uFFFD",  # Unicode replacement character (shown as ? in many PDF viewers)
+    "\uf0b7",  # Private-use Wingdings/Symbol bullet
+    "\u2022",  # Standard bullet •
+    "\u25cf",  # Black circle ●
+    "\u25cb",  # White circle ○
+    "\u25aa",  # Small black square ▪
+    "\uf0a7",  # Private-use Wingdings bullet §
+}
+
+
+def normalize_pdf_bullet_chars(text: str) -> str:
+    """Replace known non-standard bullet glyphs at line starts with standard •."""
+    lines = text.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.lstrip(" \t")
+        if stripped and stripped[0] in _PDF_BULLET_CHARS and len(stripped) >= 2 and stripped[1] in " \t":
+            line = line.replace(stripped[0], "•", 1)
+        result.append(line)
+    return "\n".join(result)
+
+
 def is_bullet_text(text: str) -> bool:
-    return bool(re.match(r"^[ \t]*[•\-*?]\s+", text.strip()))
+    return bool(re.match(r"^[ \t]*[•\-*?\uFFFD\uf0b7\u2022\u25cf\u25cb\u25aa\uf0a7]\s+", text.strip()))
 
 
 def safe_pdf_font_name(font_name: str) -> str:
@@ -224,7 +247,7 @@ def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any
                         font_size = max(font_size, float(sample.get("size", 10.0)))
                         color_value = int(sample.get("color", 0))
 
-                text = sanitize_block_text(text_lines)
+                text = normalize_pdf_bullet_chars(sanitize_block_text(text_lines))
                 line_height = calculate_line_height(lines, font_size)
                 classification = classify_text_block(text, font_size, font_name)
                 block_index = len(blocks)
@@ -508,13 +531,10 @@ def build_refined_pdf(file_bytes: bytes, pages_data: list[dict[str, Any]], bulle
         ]
 
         for block in bullet_blocks:
-            page.add_redact_annot(fitz.Rect(block["rect"]), fill=(1, 1, 1))
-        if bullet_blocks:
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        for block in bullet_blocks:
             bullet_id = block.get("bullet_id")
             rewritten_text = bullet_rewrites.get(bullet_id, block.get("text", ""))
+            rect = fitz.Rect(block["rect"])
+            page.draw_rect(rect, color=None, fill=(1, 1, 1), overlay=True)
             fit_bullet_text_to_block(page, block, rewritten_text)
 
     buffer = BytesIO()
