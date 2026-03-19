@@ -382,9 +382,13 @@ def is_valid_bullet_rewrite(original_bullet: dict[str, Any], rewritten_text: str
     return min_chars <= len(rewritten_text) <= max_chars
 
 
-def rewrite_bullet_batch(client: OpenAI, bullets: list[dict[str, Any]], job_description: str, strict: bool = False) -> dict[int, str]:
+def rewrite_bullet_batch(client: OpenAI, bullets: list[dict[str, Any]], job_description: str, strict: bool = False, suggestions: list[str] | None = None) -> dict[int, str]:
     if not bullets:
         return {}
+
+    suggestions_block = ""
+    if suggestions:
+        suggestions_block = "\n\nKey improvements to apply where relevant:\n" + "\n".join(f"- {s}" for s in suggestions)
 
     response = client.responses.create(
         model="gpt-4.1-mini",
@@ -393,7 +397,8 @@ def rewrite_bullet_batch(client: OpenAI, bullets: list[dict[str, Any]], job_desc
             {
                 "role": "user",
                 "content": (
-                    f"Job Description:\n{job_description}\n\n"
+                    f"Job Description:\n{job_description}"
+                    f"{suggestions_block}\n\n"
                     f"Rewrite these bullets in order:\n{build_bullet_rewrite_request(bullets, strict=strict)}"
                 ),
             },
@@ -403,12 +408,12 @@ def rewrite_bullet_batch(client: OpenAI, bullets: list[dict[str, Any]], job_desc
     return {bullet["id"]: parsed[bullet["id"]] for bullet in bullets if bullet["id"] in parsed}
 
 
-def rewrite_pdf_bullets(client: OpenAI, bullets: list[dict[str, Any]], job_description: str) -> dict[int, str]:
+def rewrite_pdf_bullets(client: OpenAI, bullets: list[dict[str, Any]], job_description: str, suggestions: list[str] | None = None) -> dict[int, str]:
     rewritten: dict[int, str] = {}
 
     for start in range(0, len(bullets), MAX_BATCH_BULLETS):
         batch = bullets[start:start + MAX_BATCH_BULLETS]
-        first_pass = rewrite_bullet_batch(client, batch, job_description, strict=False)
+        first_pass = rewrite_bullet_batch(client, batch, job_description, strict=False, suggestions=suggestions)
         invalid = [
             bullet for bullet in batch
             if bullet["id"] not in first_pass or not is_valid_bullet_rewrite(bullet, first_pass[bullet["id"]])
@@ -419,7 +424,7 @@ def rewrite_pdf_bullets(client: OpenAI, bullets: list[dict[str, Any]], job_descr
                 rewritten[bullet["id"]] = candidate
 
         if invalid:
-            second_pass = rewrite_bullet_batch(client, invalid, job_description, strict=True)
+            second_pass = rewrite_bullet_batch(client, invalid, job_description, strict=True, suggestions=suggestions)
             for bullet in invalid:
                 candidate = second_pass.get(bullet["id"])
                 rewritten[bullet["id"]] = candidate if candidate and is_valid_bullet_rewrite(bullet, candidate) else bullet["original_text"]
@@ -476,7 +481,7 @@ def fit_bullet_text_to_block(page: fitz.Page, block: dict[str, Any], text: str) 
     rect = fitz.Rect(block["rect"])
     color = pdf_color_tuple(block.get("color", 0))
     base_font_size = min(float(block.get("size", 10.0)), MAX_FONT_SIZE)
-    minimum_font_size = max(MIN_FONT_SIZE, base_font_size * 0.9)
+    minimum_font_size = MIN_FONT_SIZE
     line_height = float(block.get("line_height", 1.05))
     font_candidates: list[str] = []
     for candidate in [block.get("font", ""), safe_pdf_font_name(block.get("font", ""))]:
@@ -541,7 +546,7 @@ def process_resume_request(uploaded_resume: Any, job_description: str) -> dict[s
     download_filename = "refined_resume.pdf"
 
     if file_extension == "pdf" and resume_data.get("bullets"):
-        bullet_rewrites = rewrite_pdf_bullets(client, resume_data["bullets"], job_description)
+        bullet_rewrites = rewrite_pdf_bullets(client, resume_data["bullets"], job_description, suggestions)
         refined_resume = build_refined_resume_text(resume_data["pages"], bullet_rewrites)
         refined_pdf_bytes = build_refined_pdf(file_bytes, resume_data["pages"], bullet_rewrites)
         download_filename = generate_download_filename(uploaded_resume.name)
