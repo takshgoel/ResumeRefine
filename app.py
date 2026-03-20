@@ -94,7 +94,7 @@ def clean_resume_output(text: str) -> str:
     cleaned = re.sub(r"^---+$", "", cleaned, flags=re.MULTILINE)
     cleaned = cleaned.replace("â€¢", "•")
     cleaned = cleaned.replace("ï‚·", "•")
-    cleaned = re.sub(r"(?m)^[ \t]*[?][ \t]+", "• ", cleaned)
+    cleaned = re.sub(r"(?m)^[ \t]*[?\uFFFD\uf0b7\u2022\u25cf\u25cb\u25aa\uf0a7][ \t]+", "• ", cleaned)
     cleaned = re.sub(r"(?m)^[ \t]*[\-*][ \t]*", "- ", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\n[ \t]+\n", "\n\n", cleaned)
@@ -107,8 +107,31 @@ def normalize_bullet_text(text: str) -> str:
     return f"• {cleaned}" if cleaned else ""
 
 
+_PDF_BULLET_CHARS = {
+    "\uFFFD",  # Unicode replacement character (shown as ? in many PDF viewers)
+    "\uf0b7",  # Private-use Wingdings/Symbol bullet
+    "\u2022",  # Standard bullet •
+    "\u25cf",  # Black circle ●
+    "\u25cb",  # White circle ○
+    "\u25aa",  # Small black square ▪
+    "\uf0a7",  # Private-use Wingdings bullet §
+}
+
+
+def normalize_pdf_bullet_chars(text: str) -> str:
+    """Replace known non-standard bullet glyphs at line starts with standard •."""
+    lines = text.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.lstrip(" \t")
+        if stripped and stripped[0] in _PDF_BULLET_CHARS and len(stripped) >= 2 and stripped[1] in " \t":
+            line = line.replace(stripped[0], "•", 1)
+        result.append(line)
+    return "\n".join(result)
+
+
 def is_bullet_text(text: str) -> bool:
-    return bool(re.match(r"^[ \t]*[•\-*?]\s+", text.strip()))
+    return bool(re.match(r"^[ \t]*[•\-*?\uFFFD\uf0b7\u2022\u25cf\u25cb\u25aa\uf0a7]\s+", text.strip()))
 
 
 def safe_pdf_font_name(font_name: str) -> str:
@@ -224,7 +247,7 @@ def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any
                         font_size = max(font_size, float(sample.get("size", 10.0)))
                         color_value = int(sample.get("color", 0))
 
-                text = sanitize_block_text(text_lines)
+                text = normalize_pdf_bullet_chars(sanitize_block_text(text_lines))
                 line_height = calculate_line_height(lines, font_size)
                 classification = classify_text_block(text, font_size, font_name)
                 block_index = len(blocks)
@@ -267,6 +290,40 @@ def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any
                 blocks.append(block_data)
                 if block_data["text"]:
                     page_text.append(block_data["text"])
+
+            # ── Second pass: catch the two-block bullet pattern ──────────────
+            # Some PDFs store the bullet glyph (•, ?, –) in a tiny structural
+            # block and the content in the VERY NEXT block (classified BODY).
+            # Promote those BODY blocks to BULLET_POINT so they get rewritten.
+            _LONE_BULLET_CHARS = {"•", "?", "-", "–", "—", "*", "·", "○", "▪", "▸"}
+            for i, blk in enumerate(blocks):
+                if (
+                    blk.get("is_structural")
+                    and blk.get("text", "").strip() in _LONE_BULLET_CHARS
+                    and i + 1 < len(blocks)
+                ):
+                    nxt = blocks[i + 1]
+                    if nxt.get("classification") in ("BODY", "HEADER") and not nxt.get("is_structural"):
+                        nxt["classification"] = "BULLET_POINT"
+                        bullet_id = len(bullets)
+                        normalized_bullet = normalize_bullet_text(nxt["text"])
+                        bullet_data = {
+                            "id": bullet_id,
+                            "page_index": page_index,
+                            "block_index": i + 1,
+                            "text": normalized_bullet or nxt["text"],
+                            "original_text": normalized_bullet or nxt["text"],
+                            "char_count": len(normalized_bullet or nxt["text"]),
+                            "rect": nxt["rect"],
+                            "font": nxt.get("font", SAFE_FONT_REGULAR),
+                            "size": nxt.get("size", 10.0),
+                            "line_height": nxt.get("line_height", 1.05),
+                            "color": nxt.get("color", 0),
+                        }
+                        bullets.append(bullet_data)
+                        nxt["bullet_id"] = bullet_id
+                        nxt["text"] = normalized_bullet or nxt["text"]
+            # ─────────────────────────────────────────────────────────────────
 
             pages.append({"page_index": page_index, "blocks": blocks})
 
@@ -354,8 +411,8 @@ def build_bullet_rewrite_request(bullets: list[dict[str, Any]], strict: bool = F
     intro = "Stay within the exact length bounds." if strict else "Stay as close as possible to the original length bounds."
     rows = [intro]
     for bullet in bullets:
-        min_chars = max(10, int(round(bullet["char_count"] * 0.9)))
-        max_chars = max(min_chars + 4, int(round(bullet["char_count"] * 1.1)))
+        min_chars = max(10, int(round(bullet["char_count"] * 0.8)))
+        max_chars = max(min_chars + 4, int(round(bullet["char_count"] * 1.2)))
         rows.append(f"{bullet['id']}::min={min_chars}::max={max_chars}::bullet={bullet['original_text']}")
     return "\n".join(rows)
 
@@ -377,14 +434,18 @@ def parse_bullet_rewrite_response(response_text: str) -> dict[int, str]:
 def is_valid_bullet_rewrite(original_bullet: dict[str, Any], rewritten_text: str) -> bool:
     if not rewritten_text or not rewritten_text.startswith("• "):
         return False
-    min_chars = max(10, int(round(original_bullet["char_count"] * 0.9)))
-    max_chars = max(min_chars + 4, int(round(original_bullet["char_count"] * 1.1)))
+    min_chars = max(10, int(round(original_bullet["char_count"] * 0.8)))
+    max_chars = max(min_chars + 4, int(round(original_bullet["char_count"] * 1.2)))
     return min_chars <= len(rewritten_text) <= max_chars
 
 
-def rewrite_bullet_batch(client: OpenAI, bullets: list[dict[str, Any]], job_description: str, strict: bool = False) -> dict[int, str]:
+def rewrite_bullet_batch(client: OpenAI, bullets: list[dict[str, Any]], job_description: str, strict: bool = False, suggestions: list[str] | None = None) -> dict[int, str]:
     if not bullets:
         return {}
+
+    suggestions_block = ""
+    if suggestions:
+        suggestions_block = "\n\nKey improvements to apply where relevant:\n" + "\n".join(f"- {s}" for s in suggestions)
 
     response = client.responses.create(
         model="gpt-4.1-mini",
@@ -393,7 +454,8 @@ def rewrite_bullet_batch(client: OpenAI, bullets: list[dict[str, Any]], job_desc
             {
                 "role": "user",
                 "content": (
-                    f"Job Description:\n{job_description}\n\n"
+                    f"Job Description:\n{job_description}"
+                    f"{suggestions_block}\n\n"
                     f"Rewrite these bullets in order:\n{build_bullet_rewrite_request(bullets, strict=strict)}"
                 ),
             },
@@ -403,12 +465,12 @@ def rewrite_bullet_batch(client: OpenAI, bullets: list[dict[str, Any]], job_desc
     return {bullet["id"]: parsed[bullet["id"]] for bullet in bullets if bullet["id"] in parsed}
 
 
-def rewrite_pdf_bullets(client: OpenAI, bullets: list[dict[str, Any]], job_description: str) -> dict[int, str]:
+def rewrite_pdf_bullets(client: OpenAI, bullets: list[dict[str, Any]], job_description: str, suggestions: list[str] | None = None) -> dict[int, str]:
     rewritten: dict[int, str] = {}
 
     for start in range(0, len(bullets), MAX_BATCH_BULLETS):
         batch = bullets[start:start + MAX_BATCH_BULLETS]
-        first_pass = rewrite_bullet_batch(client, batch, job_description, strict=False)
+        first_pass = rewrite_bullet_batch(client, batch, job_description, strict=False, suggestions=suggestions)
         invalid = [
             bullet for bullet in batch
             if bullet["id"] not in first_pass or not is_valid_bullet_rewrite(bullet, first_pass[bullet["id"]])
@@ -419,7 +481,7 @@ def rewrite_pdf_bullets(client: OpenAI, bullets: list[dict[str, Any]], job_descr
                 rewritten[bullet["id"]] = candidate
 
         if invalid:
-            second_pass = rewrite_bullet_batch(client, invalid, job_description, strict=True)
+            second_pass = rewrite_bullet_batch(client, invalid, job_description, strict=True, suggestions=suggestions)
             for bullet in invalid:
                 candidate = second_pass.get(bullet["id"])
                 rewritten[bullet["id"]] = candidate if candidate and is_valid_bullet_rewrite(bullet, candidate) else bullet["original_text"]
@@ -470,13 +532,53 @@ def try_insert_textbox(
     return True
 
 
+def _test_text_fits(rect: fitz.Rect, text: str, font_name: str, font_size: float, line_height: float) -> bool:
+    """Test if text fits in a rect WITHOUT modifying any real page (uses a throwaway doc)."""
+    try:
+        tmp = fitz.open()
+        p = tmp.new_page(width=max(rect.width + 20, 100), height=max(rect.height * 4, 100))
+        shape = p.new_shape()
+        remaining = shape.insert_textbox(
+            fitz.Rect(0, 0, rect.width, rect.height * 3),
+            text,
+            fontname=font_name,
+            fontsize=font_size,
+            align=fitz.TEXT_ALIGN_LEFT,
+            lineheight=line_height,
+        )
+        tmp.close()
+        return remaining >= 0
+    except Exception:
+        return False
+
+
+def _register_page_fonts(document: fitz.Document, page: fitz.Page) -> None:
+    """Register fonts embedded in this PDF page so insert_textbox can reuse the original font."""
+    try:
+        for font_info in page.get_fonts(full=True):
+            xref = font_info[0]
+            basefont = font_info[3]  # PostScript / basefont name
+            if xref == 0 or not basefont:
+                continue
+            font_data = document.extract_font(xref)
+            # extract_font → (basename, ext, subtype, buffer, referencer)
+            if not font_data or not font_data[3]:
+                continue
+            try:
+                page.insert_font(fontname=basefont, fontbuffer=font_data[3])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def fit_bullet_text_to_block(page: fitz.Page, block: dict[str, Any], text: str) -> None:
     replacement_text = normalize_bullet_text(text) or block.get("text", "")
     original_text = normalize_bullet_text(block.get("text", "")) or block.get("text", "")
     rect = fitz.Rect(block["rect"])
     color = pdf_color_tuple(block.get("color", 0))
     base_font_size = min(float(block.get("size", 10.0)), MAX_FONT_SIZE)
-    minimum_font_size = max(MIN_FONT_SIZE, base_font_size * 0.9)
+    minimum_font_size = MIN_FONT_SIZE
     line_height = float(block.get("line_height", 1.05))
     font_candidates: list[str] = []
     for candidate in [block.get("font", ""), safe_pdf_font_name(block.get("font", ""))]:
@@ -492,25 +594,61 @@ def fit_bullet_text_to_block(page: fitz.Page, block: dict[str, Any], text: str) 
                 font_size -= 0.25
 
 
+def _safe_redact_and_insert(
+    page: fitz.Page,
+    block: dict[str, Any],
+    rewritten_text: str,
+) -> None:
+    """
+    Redact a single bullet block and insert replacement text.
+
+    We pre-check that at least one text variant fits before committing the
+    redaction, so we never leave a white gap where text should be.
+    """
+    rect = fitz.Rect(block["rect"])
+    # Shrink rect by 1 pt on every side to avoid clipping neighbouring content.
+    safe_rect = fitz.Rect(rect.x0 + 1, rect.y0, rect.x1 - 1, rect.y1)
+
+    font_name = safe_pdf_font_name(block.get("font", ""))
+    font_size = min(float(block.get("size", 10.0)), MAX_FONT_SIZE)
+    line_height = float(block.get("line_height", 1.05))
+
+    replacement = normalize_bullet_text(rewritten_text) or block.get("text", "")
+    original = normalize_bullet_text(block.get("text", "")) or block.get("text", "")
+
+    # Only redact when we are confident the text can be reinserted.
+    can_fit = (
+        _test_text_fits(safe_rect, replacement, font_name, font_size, line_height)
+        or _test_text_fits(safe_rect, original, font_name, font_size, line_height)
+    )
+    if not can_fit:
+        return  # Leave the original text untouched rather than leaving a blank.
+
+    # Redact this one block and immediately reinsert.
+    page.add_redact_annot(safe_rect, fill=(1, 1, 1))
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+    fit_bullet_text_to_block(page, block, rewritten_text)
+
+
 def build_refined_pdf(file_bytes: bytes, pages_data: list[dict[str, Any]], bullet_rewrites: dict[int, str]) -> bytes:
     document = fitz.open(stream=file_bytes, filetype="pdf")
 
     for page_data in pages_data:
         page = document[page_data["page_index"]]
+
+        # Register embedded fonts so insert_textbox can use the original typeface.
+        _register_page_fonts(document, page)
+
         bullet_blocks = [
             block for block in page_data.get("blocks", [])
             if block.get("classification") == "BULLET_POINT" and not block.get("is_structural")
         ]
 
         for block in bullet_blocks:
-            page.add_redact_annot(fitz.Rect(block["rect"]), fill=(1, 1, 1))
-        if bullet_blocks:
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        for block in bullet_blocks:
             bullet_id = block.get("bullet_id")
             rewritten_text = bullet_rewrites.get(bullet_id, block.get("text", ""))
-            fit_bullet_text_to_block(page, block, rewritten_text)
+            # Process each block individually: pre-check → redact → insert.
+            _safe_redact_and_insert(page, block, rewritten_text)
 
     buffer = BytesIO()
     document.save(buffer, garbage=4, deflate=True)
@@ -541,7 +679,7 @@ def process_resume_request(uploaded_resume: Any, job_description: str) -> dict[s
     download_filename = "refined_resume.pdf"
 
     if file_extension == "pdf" and resume_data.get("bullets"):
-        bullet_rewrites = rewrite_pdf_bullets(client, resume_data["bullets"], job_description)
+        bullet_rewrites = rewrite_pdf_bullets(client, resume_data["bullets"], job_description, suggestions)
         refined_resume = build_refined_resume_text(resume_data["pages"], bullet_rewrites)
         refined_pdf_bytes = build_refined_pdf(file_bytes, resume_data["pages"], bullet_rewrites)
         download_filename = generate_download_filename(uploaded_resume.name)
