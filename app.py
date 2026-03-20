@@ -329,6 +329,7 @@ def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any
                 if nxt.get("classification") == "BULLET_POINT" and not nxt.get("is_structural"):
                     # Case A: already a bullet — widen its rect to include glyph position.
                     nxt["bullet_glyph_rect"] = list(blk["rect"])
+                    blk["glyph_paired"] = True  # atomic with content block in build_refined_pdf
 
                 elif (
                     nxt.get("classification") in ("BODY", "HEADER")
@@ -339,6 +340,7 @@ def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any
                     # Case B: promote genuine bullet content to BULLET_POINT.
                     nxt["classification"] = "BULLET_POINT"
                     nxt["bullet_glyph_rect"] = list(blk["rect"])
+                    blk["glyph_paired"] = True  # atomic with content block in build_refined_pdf
                     bullet_id = len(bullets)
                     normalized_bullet = normalize_bullet_text(nxt["text"])
                     line_count = len([ln for ln in nxt["text"].splitlines() if ln.strip()])
@@ -455,18 +457,18 @@ def generate_download_filename(original_filename: str) -> str:
 def _bullet_char_bounds(bullet: dict[str, Any]) -> tuple[int, int]:
     """Return (min_chars, max_chars) for a bullet rewrite.
 
-    Single-line bullets must not grow — a longer rewrite would push content
-    onto a second line and break the PDF layout.  Multi-line bullets get a
-    modest ±10 % window.
+    Single-line bullets get a small ±8 % window so rewrites can incorporate
+    keywords without pushing content onto a second line.  Multi-line bullets
+    get a ±12 % window.  The AI is also told to stay within these bounds.
     """
     original = bullet["char_count"]
     is_single_line = bullet.get("line_count", 1) == 1
     if is_single_line:
         min_chars = max(10, int(round(original * 0.88)))
-        max_chars = int(round(original * 1.0))   # no increase for single-line
+        max_chars = max(min_chars + 4, int(round(original * 1.08)))
     else:
-        min_chars = max(10, int(round(original * 0.88)))
-        max_chars = max(min_chars + 4, int(round(original * 1.10)))
+        min_chars = max(10, int(round(original * 0.85)))
+        max_chars = max(min_chars + 4, int(round(original * 1.12)))
     return min_chars, max_chars
 
 
@@ -663,30 +665,32 @@ def _safe_redact_and_insert(
     """
     Redact a single bullet block and insert replacement text.
 
-    We pre-check that at least one text variant fits before committing the
-    redaction, so we never leave a white gap where text should be.
+    The previous approach used a Helvetica-based fit pre-check which was too
+    conservative: Helvetica is ~15 % wider than the common serif/narrow fonts
+    used in resumes, so the check rejected valid rewrites and left blocks
+    untouched (0 changes) or, for two-block bullets, left white gaps after the
+    glyph block was already erased.
+
+    New approach: always proceed.  fit_bullet_text_to_block cascades through
+    the registered original font → Helvetica fallback and shrinks the font size
+    down to MIN_FONT_SIZE, so it almost never fails to produce output.  The only
+    safety net we keep is a degenerate-case guard using MIN_FONT_SIZE + wide
+    rect so we still skip if the text is genuinely unrenderable.
     """
     rect = fitz.Rect(block["rect"])
-    # Shrink rect by 1 pt on every side to avoid clipping neighbouring content.
-    safe_rect = fitz.Rect(rect.x0 + 1, rect.y0, rect.x1 - 1, rect.y1)
-
-    font_name = safe_pdf_font_name(block.get("font", ""))
     font_size = min(float(block.get("size", 10.0)), MAX_FONT_SIZE)
     line_height = float(block.get("line_height", 1.05))
-
-    replacement = normalize_bullet_text(rewritten_text) or block.get("text", "")
     original = normalize_bullet_text(block.get("text", "")) or block.get("text", "")
 
-    # Only redact when we are confident the text can be reinserted.
-    can_fit = (
-        _test_text_fits(safe_rect, replacement, font_name, font_size, line_height)
-        or _test_text_fits(safe_rect, original, font_name, font_size, line_height)
-    )
-    if not can_fit:
-        return  # Leave the original text untouched rather than leaving a blank.
+    # Degenerate guard only: test at MIN_FONT_SIZE with a very generous rect
+    # (3× width, 5× height).  If even that fails, skip to avoid a blank area.
+    generous = fitz.Rect(0, 0, rect.width * 3, rect.height * 5)
+    if not _test_text_fits(generous, original, SAFE_FONT_REGULAR, MIN_FONT_SIZE, line_height):
+        return
 
-    # Redact this one block and immediately reinsert.
-    page.add_redact_annot(safe_rect, fill=(1, 1, 1))
+    # Redact without inset — the 1 pt shrink was masking the leftmost pixel of
+    # the bullet glyph on narrow rects.
+    page.add_redact_annot(rect, fill=(1, 1, 1))
     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
     fit_bullet_text_to_block(page, block, rewritten_text)
 
@@ -700,10 +704,14 @@ def build_refined_pdf(file_bytes: bytes, pages_data: list[dict[str, Any]], bulle
         # Register embedded fonts so insert_textbox can use the original typeface.
         _register_page_fonts(document, page)
 
-        # Step 1: Remove lone bullet-glyph blocks (•, ?) that were paired with
-        # a content block via the two-block detection in extract_resume_data.
+        # Step 1: Remove ONLY stray lone-glyph blocks that are NOT paired with a
+        # bullet content block (Case C in extract_resume_data).  Paired glyph
+        # blocks (Cases A/B, marked glyph_paired=True) are handled atomically in
+        # Step 2 via the expanded rect, so we must NOT erase them here — doing so
+        # would leave the content block without its bullet marker if Step 2 later
+        # fails to reinsert.
         for block in page_data.get("blocks", []):
-            if block.get("needs_redact"):
+            if block.get("needs_redact") and not block.get("glyph_paired"):
                 glyph_rect = fitz.Rect(block["rect"])
                 page.add_redact_annot(glyph_rect, fill=(1, 1, 1))
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
