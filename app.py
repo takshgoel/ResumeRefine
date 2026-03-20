@@ -291,43 +291,84 @@ def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any
                 if block_data["text"]:
                     page_text.append(block_data["text"])
 
-            # ── Second pass: catch the two-block bullet pattern ──────────────
-            # Some PDFs store the bullet glyph (•, ?, –) in a tiny structural
-            # block and the content in the VERY NEXT block (classified BODY).
-            # Promote those BODY blocks to BULLET_POINT so they get rewritten.
+            # ── Second pass: handle lone bullet-glyph blocks ─────────────────
+            # Some PDFs store the bullet glyph (•, ?) in its own tiny structural
+            # block separate from the content.  Three cases:
+            #   A) Next block is already BULLET_POINT on same line → widen rect.
+            #   B) Next block is BODY/HEADER, same line, indented, no pipe →
+            #      promote to BULLET_POINT.
+            #   C) Everything else (glyph before company/date/header) →
+            #      just erase the stray glyph so it doesn't show in output.
             _LONE_BULLET_CHARS = {"•", "?", "-", "–", "—", "*", "·", "○", "▪", "▸"}
             for i, blk in enumerate(blocks):
-                if (
-                    blk.get("is_structural")
-                    and blk.get("text", "").strip() in _LONE_BULLET_CHARS
-                    and i + 1 < len(blocks)
+                if not (blk.get("is_structural") and blk.get("text", "").strip() in _LONE_BULLET_CHARS):
+                    continue
+
+                # Always mark stray glyph for removal.
+                blk["needs_redact"] = True
+
+                if i + 1 >= len(blocks):
+                    continue
+                nxt = blocks[i + 1]
+                if nxt.get("is_structural"):
+                    continue
+
+                glyph_x0 = float(blk["rect"][0])
+                glyph_y0 = float(blk["rect"][1])
+                content_x0 = float(nxt["rect"][0])
+                content_y0 = float(nxt["rect"][1])
+                font_h = float(blk.get("size", 10.0)) * 2.0
+
+                same_line = abs(glyph_y0 - content_y0) < font_h
+                is_indented = content_x0 > glyph_x0 + 2
+                no_pipe = "|" not in nxt.get("text", "")
+
+                if not same_line:
+                    continue
+
+                if nxt.get("classification") == "BULLET_POINT" and not nxt.get("is_structural"):
+                    # Case A: already a bullet — widen its rect to include glyph position.
+                    nxt["bullet_glyph_rect"] = list(blk["rect"])
+
+                elif (
+                    nxt.get("classification") in ("BODY", "HEADER")
+                    and not nxt.get("is_structural")
+                    and is_indented
+                    and no_pipe
                 ):
-                    nxt = blocks[i + 1]
-                    if nxt.get("classification") in ("BODY", "HEADER", "COMPANY") and not nxt.get("is_structural"):
-                        nxt["classification"] = "BULLET_POINT"
-                        # Mark the glyph block so build_refined_pdf removes it,
-                        # and store its rect so we can expand the content rect leftward.
-                        blk["needs_redact"] = True
-                        nxt["bullet_glyph_rect"] = list(blk["rect"])
-                        bullet_id = len(bullets)
-                        normalized_bullet = normalize_bullet_text(nxt["text"])
-                        bullet_data = {
-                            "id": bullet_id,
-                            "page_index": page_index,
-                            "block_index": i + 1,
-                            "text": normalized_bullet or nxt["text"],
-                            "original_text": normalized_bullet or nxt["text"],
-                            "char_count": len(normalized_bullet or nxt["text"]),
-                            "rect": nxt["rect"],
-                            "font": nxt.get("font", SAFE_FONT_REGULAR),
-                            "size": nxt.get("size", 10.0),
-                            "line_height": nxt.get("line_height", 1.05),
-                            "color": nxt.get("color", 0),
-                        }
-                        bullets.append(bullet_data)
-                        nxt["bullet_id"] = bullet_id
-                        nxt["text"] = normalized_bullet or nxt["text"]
+                    # Case B: promote genuine bullet content to BULLET_POINT.
+                    nxt["classification"] = "BULLET_POINT"
+                    nxt["bullet_glyph_rect"] = list(blk["rect"])
+                    bullet_id = len(bullets)
+                    normalized_bullet = normalize_bullet_text(nxt["text"])
+                    line_count = len([ln for ln in nxt["text"].splitlines() if ln.strip()])
+                    bullet_data = {
+                        "id": bullet_id,
+                        "page_index": page_index,
+                        "block_index": i + 1,
+                        "text": normalized_bullet or nxt["text"],
+                        "original_text": normalized_bullet or nxt["text"],
+                        "char_count": len(normalized_bullet or nxt["text"]),
+                        "line_count": max(1, line_count),
+                        "rect": nxt["rect"],
+                        "font": nxt.get("font", SAFE_FONT_REGULAR),
+                        "size": nxt.get("size", 10.0),
+                        "line_height": nxt.get("line_height", 1.05),
+                        "color": nxt.get("color", 0),
+                    }
+                    bullets.append(bullet_data)
+                    nxt["bullet_id"] = bullet_id
+                    nxt["text"] = normalized_bullet or nxt["text"]
+                # Case C: glyph already marked for removal, content stays unchanged.
             # ─────────────────────────────────────────────────────────────────
+
+            # Backfill line_count on bullets registered in the first pass.
+            for blk in blocks:
+                if blk.get("classification") == "BULLET_POINT" and "bullet_id" in blk:
+                    bid = blk["bullet_id"]
+                    if bid < len(bullets) and "line_count" not in bullets[bid]:
+                        lc = len([ln for ln in blk.get("text", "").splitlines() if ln.strip()])
+                        bullets[bid]["line_count"] = max(1, lc)
 
             pages.append({"page_index": page_index, "blocks": blocks})
 
@@ -411,12 +452,29 @@ def generate_download_filename(original_filename: str) -> str:
     return f"{original.stem}_resumerefine.pdf"
 
 
+def _bullet_char_bounds(bullet: dict[str, Any]) -> tuple[int, int]:
+    """Return (min_chars, max_chars) for a bullet rewrite.
+
+    Single-line bullets must not grow — a longer rewrite would push content
+    onto a second line and break the PDF layout.  Multi-line bullets get a
+    modest ±10 % window.
+    """
+    original = bullet["char_count"]
+    is_single_line = bullet.get("line_count", 1) == 1
+    if is_single_line:
+        min_chars = max(10, int(round(original * 0.88)))
+        max_chars = int(round(original * 1.0))   # no increase for single-line
+    else:
+        min_chars = max(10, int(round(original * 0.88)))
+        max_chars = max(min_chars + 4, int(round(original * 1.10)))
+    return min_chars, max_chars
+
+
 def build_bullet_rewrite_request(bullets: list[dict[str, Any]], strict: bool = False) -> str:
     intro = "Stay within the exact length bounds." if strict else "Stay as close as possible to the original length bounds."
     rows = [intro]
     for bullet in bullets:
-        min_chars = max(10, int(round(bullet["char_count"] * 0.8)))
-        max_chars = max(min_chars + 4, int(round(bullet["char_count"] * 1.2)))
+        min_chars, max_chars = _bullet_char_bounds(bullet)
         rows.append(f"{bullet['id']}::min={min_chars}::max={max_chars}::bullet={bullet['original_text']}")
     return "\n".join(rows)
 
@@ -438,8 +496,7 @@ def parse_bullet_rewrite_response(response_text: str) -> dict[int, str]:
 def is_valid_bullet_rewrite(original_bullet: dict[str, Any], rewritten_text: str) -> bool:
     if not rewritten_text or not rewritten_text.startswith("• "):
         return False
-    min_chars = max(10, int(round(original_bullet["char_count"] * 0.8)))
-    max_chars = max(min_chars + 4, int(round(original_bullet["char_count"] * 1.2)))
+    min_chars, max_chars = _bullet_char_bounds(original_bullet)
     return min_chars <= len(rewritten_text) <= max_chars
 
 
