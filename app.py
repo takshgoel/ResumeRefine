@@ -181,7 +181,7 @@ def classify_text_block(text: str, font_size: float, font_name: str) -> str:
     lowered = stripped.lower()
     if any(keyword in lowered for keyword in ROLE_KEYWORDS) and len(stripped) <= 120:
         return "ROLE"
-    if ("|" in stripped or "," in stripped) and len(stripped) <= 120 and not stripped.endswith("."):
+    if "|" in stripped and len(stripped) <= 120 and not stripped.endswith("."):
         return "COMPANY"
     return "BODY"
 
@@ -303,8 +303,12 @@ def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any
                     and i + 1 < len(blocks)
                 ):
                     nxt = blocks[i + 1]
-                    if nxt.get("classification") in ("BODY", "HEADER") and not nxt.get("is_structural"):
+                    if nxt.get("classification") in ("BODY", "HEADER", "COMPANY") and not nxt.get("is_structural"):
                         nxt["classification"] = "BULLET_POINT"
+                        # Mark the glyph block so build_refined_pdf removes it,
+                        # and store its rect so we can expand the content rect leftward.
+                        blk["needs_redact"] = True
+                        nxt["bullet_glyph_rect"] = list(blk["rect"])
                         bullet_id = len(bullets)
                         normalized_bullet = normalize_bullet_text(nxt["text"])
                         bullet_data = {
@@ -639,6 +643,15 @@ def build_refined_pdf(file_bytes: bytes, pages_data: list[dict[str, Any]], bulle
         # Register embedded fonts so insert_textbox can use the original typeface.
         _register_page_fonts(document, page)
 
+        # Step 1: Remove lone bullet-glyph blocks (•, ?) that were paired with
+        # a content block via the two-block detection in extract_resume_data.
+        for block in page_data.get("blocks", []):
+            if block.get("needs_redact"):
+                glyph_rect = fitz.Rect(block["rect"])
+                page.add_redact_annot(glyph_rect, fill=(1, 1, 1))
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        # Step 2: Rewrite every detected bullet block.
         bullet_blocks = [
             block for block in page_data.get("blocks", [])
             if block.get("classification") == "BULLET_POINT" and not block.get("is_structural")
@@ -647,8 +660,24 @@ def build_refined_pdf(file_bytes: bytes, pages_data: list[dict[str, Any]], bulle
         for block in bullet_blocks:
             bullet_id = block.get("bullet_id")
             rewritten_text = bullet_rewrites.get(bullet_id, block.get("text", ""))
-            # Process each block individually: pre-check → redact → insert.
-            _safe_redact_and_insert(page, block, rewritten_text)
+
+            # For two-block bullets the content rect starts to the right of the
+            # glyph block.  Expand it leftward so the • sits at the correct
+            # horizontal position.
+            if block.get("bullet_glyph_rect"):
+                glyph_r = fitz.Rect(block["bullet_glyph_rect"])
+                content_r = fitz.Rect(block["rect"])
+                expanded = fitz.Rect(
+                    min(glyph_r.x0, content_r.x0),
+                    content_r.y0,
+                    content_r.x1,
+                    content_r.y1,
+                )
+                block_copy = dict(block)
+                block_copy["rect"] = list(expanded)
+                _safe_redact_and_insert(page, block_copy, rewritten_text)
+            else:
+                _safe_redact_and_insert(page, block, rewritten_text)
 
     buffer = BytesIO()
     document.save(buffer, garbage=4, deflate=True)
