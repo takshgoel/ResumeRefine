@@ -291,6 +291,40 @@ def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any
                 if block_data["text"]:
                     page_text.append(block_data["text"])
 
+            # ── Second pass: catch the two-block bullet pattern ──────────────
+            # Some PDFs store the bullet glyph (•, ?, –) in a tiny structural
+            # block and the content in the VERY NEXT block (classified BODY).
+            # Promote those BODY blocks to BULLET_POINT so they get rewritten.
+            _LONE_BULLET_CHARS = {"•", "?", "-", "–", "—", "*", "·", "○", "▪", "▸"}
+            for i, blk in enumerate(blocks):
+                if (
+                    blk.get("is_structural")
+                    and blk.get("text", "").strip() in _LONE_BULLET_CHARS
+                    and i + 1 < len(blocks)
+                ):
+                    nxt = blocks[i + 1]
+                    if nxt.get("classification") in ("BODY", "HEADER") and not nxt.get("is_structural"):
+                        nxt["classification"] = "BULLET_POINT"
+                        bullet_id = len(bullets)
+                        normalized_bullet = normalize_bullet_text(nxt["text"])
+                        bullet_data = {
+                            "id": bullet_id,
+                            "page_index": page_index,
+                            "block_index": i + 1,
+                            "text": normalized_bullet or nxt["text"],
+                            "original_text": normalized_bullet or nxt["text"],
+                            "char_count": len(normalized_bullet or nxt["text"]),
+                            "rect": nxt["rect"],
+                            "font": nxt.get("font", SAFE_FONT_REGULAR),
+                            "size": nxt.get("size", 10.0),
+                            "line_height": nxt.get("line_height", 1.05),
+                            "color": nxt.get("color", 0),
+                        }
+                        bullets.append(bullet_data)
+                        nxt["bullet_id"] = bullet_id
+                        nxt["text"] = normalized_bullet or nxt["text"]
+            # ─────────────────────────────────────────────────────────────────
+
             pages.append({"page_index": page_index, "blocks": blocks})
 
         document.close()
@@ -498,6 +532,46 @@ def try_insert_textbox(
     return True
 
 
+def _test_text_fits(rect: fitz.Rect, text: str, font_name: str, font_size: float, line_height: float) -> bool:
+    """Test if text fits in a rect WITHOUT modifying any real page (uses a throwaway doc)."""
+    try:
+        tmp = fitz.open()
+        p = tmp.new_page(width=max(rect.width + 20, 100), height=max(rect.height * 4, 100))
+        shape = p.new_shape()
+        remaining = shape.insert_textbox(
+            fitz.Rect(0, 0, rect.width, rect.height * 3),
+            text,
+            fontname=font_name,
+            fontsize=font_size,
+            align=fitz.TEXT_ALIGN_LEFT,
+            lineheight=line_height,
+        )
+        tmp.close()
+        return remaining >= 0
+    except Exception:
+        return False
+
+
+def _register_page_fonts(document: fitz.Document, page: fitz.Page) -> None:
+    """Register fonts embedded in this PDF page so insert_textbox can reuse the original font."""
+    try:
+        for font_info in page.get_fonts(full=True):
+            xref = font_info[0]
+            basefont = font_info[3]  # PostScript / basefont name
+            if xref == 0 or not basefont:
+                continue
+            font_data = document.extract_font(xref)
+            # extract_font → (basename, ext, subtype, buffer, referencer)
+            if not font_data or not font_data[3]:
+                continue
+            try:
+                page.insert_font(fontname=basefont, fontbuffer=font_data[3])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def fit_bullet_text_to_block(page: fitz.Page, block: dict[str, Any], text: str) -> None:
     replacement_text = normalize_bullet_text(text) or block.get("text", "")
     original_text = normalize_bullet_text(block.get("text", "")) or block.get("text", "")
@@ -520,25 +594,61 @@ def fit_bullet_text_to_block(page: fitz.Page, block: dict[str, Any], text: str) 
                 font_size -= 0.25
 
 
+def _safe_redact_and_insert(
+    page: fitz.Page,
+    block: dict[str, Any],
+    rewritten_text: str,
+) -> None:
+    """
+    Redact a single bullet block and insert replacement text.
+
+    We pre-check that at least one text variant fits before committing the
+    redaction, so we never leave a white gap where text should be.
+    """
+    rect = fitz.Rect(block["rect"])
+    # Shrink rect by 1 pt on every side to avoid clipping neighbouring content.
+    safe_rect = fitz.Rect(rect.x0 + 1, rect.y0, rect.x1 - 1, rect.y1)
+
+    font_name = safe_pdf_font_name(block.get("font", ""))
+    font_size = min(float(block.get("size", 10.0)), MAX_FONT_SIZE)
+    line_height = float(block.get("line_height", 1.05))
+
+    replacement = normalize_bullet_text(rewritten_text) or block.get("text", "")
+    original = normalize_bullet_text(block.get("text", "")) or block.get("text", "")
+
+    # Only redact when we are confident the text can be reinserted.
+    can_fit = (
+        _test_text_fits(safe_rect, replacement, font_name, font_size, line_height)
+        or _test_text_fits(safe_rect, original, font_name, font_size, line_height)
+    )
+    if not can_fit:
+        return  # Leave the original text untouched rather than leaving a blank.
+
+    # Redact this one block and immediately reinsert.
+    page.add_redact_annot(safe_rect, fill=(1, 1, 1))
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+    fit_bullet_text_to_block(page, block, rewritten_text)
+
+
 def build_refined_pdf(file_bytes: bytes, pages_data: list[dict[str, Any]], bullet_rewrites: dict[int, str]) -> bytes:
     document = fitz.open(stream=file_bytes, filetype="pdf")
 
     for page_data in pages_data:
         page = document[page_data["page_index"]]
+
+        # Register embedded fonts so insert_textbox can use the original typeface.
+        _register_page_fonts(document, page)
+
         bullet_blocks = [
             block for block in page_data.get("blocks", [])
             if block.get("classification") == "BULLET_POINT" and not block.get("is_structural")
         ]
 
         for block in bullet_blocks:
-            page.add_redact_annot(fitz.Rect(block["rect"]), fill=(1, 1, 1))
-        if bullet_blocks:
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        for block in bullet_blocks:
             bullet_id = block.get("bullet_id")
             rewritten_text = bullet_rewrites.get(bullet_id, block.get("text", ""))
-            fit_bullet_text_to_block(page, block, rewritten_text)
+            # Process each block individually: pre-check → redact → insert.
+            _safe_redact_and_insert(page, block, rewritten_text)
 
     buffer = BytesIO()
     document.save(buffer, garbage=4, deflate=True)
