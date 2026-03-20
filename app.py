@@ -103,6 +103,7 @@ def clean_resume_output(text: str) -> str:
 
 def normalize_bullet_text(text: str) -> str:
     cleaned = clean_resume_output(text).strip()
+    cleaned = _fix_garbled_text(cleaned)
     cleaned = re.sub(r"^[•\-*?\s]+", "", cleaned).strip()
     return f"• {cleaned}" if cleaned else ""
 
@@ -116,6 +117,24 @@ _PDF_BULLET_CHARS = {
     "\u25aa",  # Small black square ▪
     "\uf0a7",  # Private-use Wingdings bullet §
 }
+
+
+def _fix_garbled_text(text: str) -> str:
+    """Fix common garbled characters from PDF font encoding issues.
+
+    Many PDFs encode curly apostrophes / smart quotes in Symbol or Wingdings
+    fonts.  PyMuPDF extracts these as literal ``?`` because the glyph has no
+    Unicode mapping.  We detect likely contractions and replace with a normal
+    apostrophe so reinserted text reads correctly.
+    """
+    text = re.sub(r"(?<=[A-Za-z])\?(?=s\b)", "\u2019", text)   # Dean?s → Dean's
+    text = re.sub(r"(?<=[A-Za-z])\?(?=t\b)", "\u2019", text)   # don?t  → don't
+    text = re.sub(r"(?<=[A-Za-z])\?(?=ve\b)", "\u2019", text)  # we?ve  → we've
+    text = re.sub(r"(?<=[A-Za-z])\?(?=re\b)", "\u2019", text)  # you?re → you're
+    text = re.sub(r"(?<=[A-Za-z])\?(?=ll\b)", "\u2019", text)  # you?ll → you'll
+    text = re.sub(r"(?<=[A-Za-z])\?(?=d\b)", "\u2019", text)   # we?d   → we'd
+    text = re.sub(r"(?<=[A-Za-z])\?(?=m\b)", "\u2019", text)   # I?m    → I'm
+    return text
 
 
 def normalize_pdf_bullet_chars(text: str) -> str:
@@ -198,7 +217,6 @@ def calculate_line_height(lines: list[dict[str, Any]], fallback_size: float) -> 
     return max(0.95, min(1.35, ratio))
 
 
-@st.cache_data(show_spinner=False)
 def extract_resume_data(file_bytes: bytes, file_extension: str) -> dict[str, Any]:
     if file_extension == "pdf":
         document = fitz.open(stream=file_bytes, filetype="pdf")
@@ -595,25 +613,6 @@ def try_insert_textbox(
     return True
 
 
-def _test_text_fits(rect: fitz.Rect, text: str, font_name: str, font_size: float, line_height: float) -> bool:
-    """Test if text fits in a rect WITHOUT modifying any real page (uses a throwaway doc)."""
-    try:
-        tmp = fitz.open()
-        p = tmp.new_page(width=max(rect.width + 20, 100), height=max(rect.height * 4, 100))
-        shape = p.new_shape()
-        remaining = shape.insert_textbox(
-            fitz.Rect(0, 0, rect.width, rect.height * 3),
-            text,
-            fontname=font_name,
-            fontsize=font_size,
-            align=fitz.TEXT_ALIGN_LEFT,
-            lineheight=line_height,
-        )
-        tmp.close()
-        return remaining >= 0
-    except Exception:
-        return False
-
 
 def _register_page_fonts(document: fitz.Document, page: fitz.Page) -> None:
     """Register fonts embedded in this PDF page so insert_textbox can reuse the original font."""
@@ -657,92 +656,74 @@ def fit_bullet_text_to_block(page: fitz.Page, block: dict[str, Any], text: str) 
                 font_size -= 0.25
 
 
-def _safe_redact_and_insert(
-    page: fitz.Page,
-    block: dict[str, Any],
-    rewritten_text: str,
-) -> None:
-    """
-    Redact a single bullet block and insert replacement text.
-
-    The previous approach used a Helvetica-based fit pre-check which was too
-    conservative: Helvetica is ~15 % wider than the common serif/narrow fonts
-    used in resumes, so the check rejected valid rewrites and left blocks
-    untouched (0 changes) or, for two-block bullets, left white gaps after the
-    glyph block was already erased.
-
-    New approach: always proceed.  fit_bullet_text_to_block cascades through
-    the registered original font → Helvetica fallback and shrinks the font size
-    down to MIN_FONT_SIZE, so it almost never fails to produce output.  The only
-    safety net we keep is a degenerate-case guard using MIN_FONT_SIZE + wide
-    rect so we still skip if the text is genuinely unrenderable.
-    """
-    rect = fitz.Rect(block["rect"])
-    font_size = min(float(block.get("size", 10.0)), MAX_FONT_SIZE)
-    line_height = float(block.get("line_height", 1.05))
-    original = normalize_bullet_text(block.get("text", "")) or block.get("text", "")
-
-    # Degenerate guard only: test at MIN_FONT_SIZE with a very generous rect
-    # (3× width, 5× height).  If even that fails, skip to avoid a blank area.
-    generous = fitz.Rect(0, 0, rect.width * 3, rect.height * 5)
-    if not _test_text_fits(generous, original, SAFE_FONT_REGULAR, MIN_FONT_SIZE, line_height):
-        return
-
-    # Redact without inset — the 1 pt shrink was masking the leftmost pixel of
-    # the bullet glyph on narrow rects.
-    page.add_redact_annot(rect, fill=(1, 1, 1))
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-    fit_bullet_text_to_block(page, block, rewritten_text)
-
 
 def build_refined_pdf(file_bytes: bytes, pages_data: list[dict[str, Any]], bullet_rewrites: dict[int, str]) -> bytes:
+    """Build a new PDF with rewritten bullet text.
+
+    Strategy (batch-redact-then-insert):
+      1. Collect ALL redaction rects for the page (stray glyphs + bullet blocks).
+      2. Apply redactions in ONE call — this rewrites the content stream only
+         once, which dramatically reduces font-corruption compared to the old
+         per-block approach (N rewrites per page).
+      3. Register embedded fonts AFTER redaction so they are available for
+         text insertion.
+      4. Insert all replacement text.
+    """
     document = fitz.open(stream=file_bytes, filetype="pdf")
 
     for page_data in pages_data:
         page = document[page_data["page_index"]]
+        blocks_to_insert: list[tuple[dict[str, Any], str]] = []
+        has_redactions = False
 
-        # Register embedded fonts so insert_textbox can use the original typeface.
-        _register_page_fonts(document, page)
-
-        # Step 1: Remove ONLY stray lone-glyph blocks that are NOT paired with a
-        # bullet content block (Case C in extract_resume_data).  Paired glyph
-        # blocks (Cases A/B, marked glyph_paired=True) are handled atomically in
-        # Step 2 via the expanded rect, so we must NOT erase them here — doing so
-        # would leave the content block without its bullet marker if Step 2 later
-        # fails to reinsert.
+        # ── Step 1a: Mark stray glyph blocks for redaction (Case C only) ──
         for block in page_data.get("blocks", []):
             if block.get("needs_redact") and not block.get("glyph_paired"):
-                glyph_rect = fitz.Rect(block["rect"])
-                page.add_redact_annot(glyph_rect, fill=(1, 1, 1))
-                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+                page.add_redact_annot(fitz.Rect(block["rect"]), fill=(1, 1, 1))
+                has_redactions = True
 
-        # Step 2: Rewrite every detected bullet block.
-        bullet_blocks = [
-            block for block in page_data.get("blocks", [])
-            if block.get("classification") == "BULLET_POINT" and not block.get("is_structural")
-        ]
-
-        for block in bullet_blocks:
+        # ── Step 1b: Mark all bullet content blocks for redaction ─────────
+        for block in page_data.get("blocks", []):
+            if block.get("classification") != "BULLET_POINT" or block.get("is_structural"):
+                continue
             bullet_id = block.get("bullet_id")
-            rewritten_text = bullet_rewrites.get(bullet_id, block.get("text", ""))
+            if bullet_id is None:
+                continue
 
-            # For two-block bullets the content rect starts to the right of the
-            # glyph block.  Expand it leftward so the • sits at the correct
-            # horizontal position.
+            rewritten_text = bullet_rewrites.get(bullet_id, block.get("text", ""))
+            content_rect = fitz.Rect(block["rect"])
+
+            # For two-block bullets, expand rect to cover the glyph block too.
             if block.get("bullet_glyph_rect"):
-                glyph_r = fitz.Rect(block["bullet_glyph_rect"])
-                content_r = fitz.Rect(block["rect"])
-                expanded = fitz.Rect(
-                    min(glyph_r.x0, content_r.x0),
-                    content_r.y0,
-                    content_r.x1,
-                    content_r.y1,
+                glyph_rect = fitz.Rect(block["bullet_glyph_rect"])
+                full_rect = fitz.Rect(
+                    min(glyph_rect.x0, content_rect.x0),
+                    content_rect.y0,
+                    content_rect.x1,
+                    content_rect.y1,
                 )
-                block_copy = dict(block)
-                block_copy["rect"] = list(expanded)
-                _safe_redact_and_insert(page, block_copy, rewritten_text)
             else:
-                _safe_redact_and_insert(page, block, rewritten_text)
+                full_rect = content_rect
+
+            page.add_redact_annot(full_rect, fill=(1, 1, 1))
+            has_redactions = True
+
+            block_copy = dict(block)
+            block_copy["rect"] = list(full_rect)
+            blocks_to_insert.append((block_copy, rewritten_text))
+
+        # ── Step 2: Apply ALL redactions in ONE call ──────────────────────
+        if has_redactions:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        # ── Step 3: Register fonts AFTER redaction ────────────────────────
+        # Font resources survive redaction (they're page-level objects).
+        # Registering now ensures insert_textbox can use the original typeface.
+        _register_page_fonts(document, page)
+
+        # ── Step 4: Insert all replacement text ───────────────────────────
+        for block_copy, rewritten_text in blocks_to_insert:
+            fit_bullet_text_to_block(page, block_copy, rewritten_text)
 
     buffer = BytesIO()
     document.save(buffer, garbage=4, deflate=True)
